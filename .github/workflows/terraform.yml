@@ -1,0 +1,118 @@
+name: terraform
+
+on:
+  pull_request:
+    paths: ["modules/**", "envs/**", "policy/**", ".github/workflows/terraform.yml"]
+  push:
+    branches: [main]
+    paths: ["modules/**", "envs/**"]
+
+permissions:
+  id-token: write      # OIDC to AWS: no long-lived keys in GitHub
+  contents: read
+  pull-requests: write # plan comment
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false # never cancel an apply halfway
+
+env:
+  TF_VERSION: 0.14.11
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hashicorp/setup-terraform@v1
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - run: terraform fmt -check -recursive
+      - name: validate modules
+        run: |
+          for d in modules/*/; do
+            (cd "$d" && terraform init -backend=false -input=false >/dev/null && terraform validate) || exit 1
+          done
+      - uses: actions/setup-python@v2
+        with: { python-version: "3.9" }
+      - name: policy checks
+        run: |
+          pip install python-hcl2==4.3.4 pytest
+          (cd policy && pytest -q)
+          python policy/check.py
+      - uses: terraform-linters/setup-tflint@v1
+      - run: tflint --recursive
+
+  plan:
+    needs: static
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [staging, prod]
+    defaults:
+      run:
+        working-directory: envs/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hashicorp/setup-terraform@v1
+        with: { terraform_version: "${{ env.TF_VERSION }}", terraform_wrapper: false }
+      - uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-terraform-plan-${{ matrix.env }}
+          aws-region: us-east-1
+      - run: terraform init -input=false
+      - name: plan
+        id: plan
+        run: |
+          terraform plan -input=false -lock-timeout=5m -out=tfplan \
+            -var "orders_api_version=${{ vars.ORDERS_API_VERSION || 'bootstrap' }}" \
+            -var "certificate_arn=${{ secrets.CERT_ARN }}"
+          terraform show -no-color tfplan > plan.txt
+          echo "::set-output name=destroys::$(terraform show -json tfplan | jq '[.resource_changes[] | select(.change.actions | index("delete"))] | length')"
+      - uses: actions/upload-artifact@v2
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: envs/${{ matrix.env }}/tfplan
+      - name: comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v4
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          DESTROYS: ${{ steps.plan.outputs.destroys }}
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync(`envs/${process.env.ENV_NAME}/plan.txt`, 'utf8');
+            const body = [
+              `### terraform plan: \`${process.env.ENV_NAME}\``,
+              process.env.DESTROYS !== '0' ? `> :warning: **${process.env.DESTROYS} resource(s) will be destroyed**` : '',
+              '<details><summary>show plan</summary>', '', '```hcl', plan.slice(-60000), '```', '</details>',
+            ].join('\n');
+            await github.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1 # staging first, then prod
+      matrix:
+        env: [staging, prod]
+    environment: ${{ matrix.env }} # prod requires reviewer approval in repo settings
+    defaults:
+      run:
+        working-directory: envs/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hashicorp/setup-terraform@v1
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-terraform-apply-${{ matrix.env }}
+          aws-region: us-east-1
+      - uses: actions/download-artifact@v2
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: envs/${{ matrix.env }}
+      - run: terraform init -input=false
+      - run: terraform apply -input=false -lock-timeout=5m tfplan # applies exactly the reviewed plan
